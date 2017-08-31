@@ -1,0 +1,339 @@
+<?php
+
+/**
+ * Pixel Pong
+ *
+ * Integrates with Pixel Ping, a pixel-tracking service from Pro Publica
+ * and DocumentCloud that runs on Node.js.
+ *
+ * http://documentcloud.github.com/pixel-ping/
+ * http://www.propublica.org/nerds/item/pixel-ping-a-nodejs-stats-tracker
+ *
+ * Requires json_decode(), and thus either PHP 5.2 or the json PECL 
+ * extension.
+ */
+
+/**
+ * Implementation of hook_menu().
+ */
+function pixel_pong_menu() {
+  $items = array();
+   
+  $items['pixel_pong/save_hits_partners'] = array(
+    'title' => t('Pixel Ping flush callback'),
+    'page callback' => 'pixel_pong_save_hits_partners',
+    'type' => MENU_CALLBACK,
+    'access arguments' => array('access content'),
+  );
+  
+  $items['admin/config/system/pixel_pong'] = array(
+    'title' => t('Pixel Pong settings'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('pixel_pong_admin_settings'),
+    'type' => MENU_NORMAL_ITEM,
+    'access arguments' => array('administer'),
+  );
+
+  $items['admin/reports/pixel_pong'] = array(
+    'title' => 'Pixel Ping hits',
+    'page callback' => '_pixel_report_partners',
+    'page arguments' => array(),
+    //'access arguments' => array('administer nodes'), /* Editor, Staff blogger and Fellow */
+    'access arguments' => array('administer content types'), // Admin and Editor
+    'type' => MENU_NORMAL_ITEM,
+  );
+    
+  $items['js/pixel.js'] = array(
+    'page callback' => '_pixel_js',
+    'access callback' => TRUE,
+  );
+    
+  return $items;
+}
+
+/**
+ * Implementation of hook_perm().
+ */
+function pixel_pong_perm() {
+  return array('administer pixel_pong');
+}
+
+/**
+ * Admin settings form.
+ */
+function pixel_pong_admin_settings() {
+  $form['pixel_ping'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Pixel Ping integration'),
+    '#collapsible' => TRUE,
+  );
+  
+  $form['pixel_ping']['pixel_pong_remote'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Pixel Ping server'),
+    '#default_value' => variable_get('pixel_pong_remote', 'http://127.0.0.1:9187'),
+    '#description' => 'The base URL where the pixel will be served.  Do not include <em>/pixel.gif</em> or a trailing slash; for instance, enter <em>http://something.com:9000</em>.',
+  );
+  
+  $form['pixel_ping']['pixel_pong_remote_secret'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Pixel Ping secret'),
+    '#default_value' => variable_get('pixel_pong_remote_secret', ''),
+    '#attributes' => array('placeholder' => t('One very good secret.')),
+    '#description' => 'The same secret on Pixel Ping config.json file.',
+  );
+  
+  $form['pixel_ping']['pixel_pong_snippet'] = array(
+    '#type' => 'text',
+    '#prefix' => t('<label>Pixel Ping snippet</label> Copy and paste this line of code and share it with partners to be included in the body of the article they are republishing.<br>')
+  );
+  
+  $form['pixel_ping']['pixel_pong_snippet_address'] = array(
+   '#markup' => t('<b>@address</b>', array('@address' => '<script type="text/javascript" src="' . $GLOBALS['base_url'] . 'js/pixel.js" async="true"></script>'))
+  );  
+
+  $form['pixel_pong_debug'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable verbose logging'),
+    '#default_value' => variable_get('pixel_pong_debug', 0),
+    '#description' => t('<strong>Not recommended for production environments:</strong> Activate this option if you want many debug messages sent to Watchdog.'),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * Callback for Pixel Ping's flush request.  A 'json'
+ * object should be posted with keys and hit counts.
+ */
+function pixel_pong_save_hits_partners() {
+  $my_secret = variable_get('pixel_pong_remote_secret','');
+
+  if(empty($my_secret)){
+    watchdog('Pixel Pong', 'For security reasons you must set a secret on your local server. Please visit %base_path/admin/settings/pixel_pong',
+    array('%base_path' => $GLOBALS['base_url']), WATCHDOG_WARNING);
+  }
+  elseif($_REQUEST['secret'] != $my_secret){
+    $secret_submitted = !empty($_REQUEST['secret']) ? $_REQUEST['secret'] : 'No secret has been sent, please verify the config.json file on node.js pixel-ping server.';
+    watchdog('Pixel Pong', 'The secret submitted doesn\'t match: @secret_submitted',
+    array('@secret_submitted' => $secret_submitted), WATCHDOG_WARNING);
+  }
+  elseif (!empty($_REQUEST['json'])) {
+    $results = json_decode($_REQUEST['json'], TRUE);
+    if ($results) {
+      pixel_pong_write_partners_hits($results);
+      if (variable_get('pixel_pong_debug', 0)) {
+        watchdog('Pixel Pong', print_r($results, TRUE), array(), WATCHDOG_DEBUG);
+      }
+    }
+  }
+  else {
+    watchdog('Pixel Pong', 'No "json" object received.  Raw data: @data', 
+    array("@data" => print_r($_REQUEST, TRUE)), WATCHDOG_WARNING);
+  }
+}
+
+/**
+ * Given a parsed $results array from pixel_pong_save_hits, increment
+ * the appropriate nodes.
+ *
+ * Almost all of this code is copied, with gratitude, from the excellent 
+ * boost_stats.php script that ships with the Boost module.
+ */
+function pixel_pong_write_hits($results) {
+  
+  if (!empty($results)) {
+    foreach ($results as $key => $val) {
+      
+      $path = split(',', $key);
+      
+      if ('node' == $path[0] && !empty($path[1])) {
+                
+        $num_updates =  0;
+        
+        $num_updates = db_update('node_counter')
+        ->fields(array(
+          'timestamp' => time(),
+        ))
+        ->expression('daycount', 'daycount + :hits', array(':hits' => $val)) 
+        ->expression('totalcount', 'totalcount + :hits', array(':hits' => $val)) 
+        ->condition('nid', $path[1], '=')
+        ->execute();
+
+        // If we affected 0 rows, this is the first time viewing the node.
+        if (!$num_updates) {
+          
+          // Check if the node exits - this prevents inserting trash on counter table
+          $node = db_select('node', 'n')
+          ->fields('n')
+          ->condition('nid', $path[1],'=')
+          ->execute()
+          ->fetchAssoc();
+
+          if($node){
+            // We must create a new row to store counters for the new node.
+            $nid = db_insert('node_counter')
+            ->fields(array(
+              'nid' => $path[1],
+              'daycount' => $val,
+              'totalcount' =>$val,
+              'timestamp' => time(),
+            ))
+            ->execute();
+          }
+        }
+        
+        if (variable_get('pixel_pong_debug', 0)) {
+          watchdog('Pixel Pong', 'Updated node nid=%node by %amount', array('%node' => $path[1], '%amount' => $val));
+        }
+      }
+    }
+  }  
+}
+
+function pixel_pong_write_partners_hits($results) {
+  
+  if (!empty($results)) {
+    foreach ($results as $key => $val) {
+      
+      $path = split(',', $key);
+      
+      if ('url' == $path[0] && !empty($path[1])) {
+                
+        $num_updates =  0;
+        
+        $num_updates = db_update('pixel_pong_partners_hits_counter')
+        ->fields(array(
+          'flush_date' => time(),
+        ))
+        ->expression('hits', 'hits + :hits', array(':hits' => $val))
+        ->condition('url', $path[2], '=')
+        ->execute();
+        
+        if (!$num_updates) {
+                   
+          // We must create a new row to store counters for the new url.
+          $nid = db_insert('pixel_pong_partners_hits_counter')
+          ->fields(array(
+            'title' => $path[1],
+            'url' => $path[2],
+            'hits' =>$val,
+            'flush_date' => time(),
+          ))
+          ->execute();
+        }
+        
+        if (variable_get('pixel_pong_debug', 0)) {
+          watchdog('Pixel Pong', 'Flush has occured ', array());
+        }
+      }
+    }
+  }  
+}
+
+/**
+ * Report - Partners Hits
+ */
+function _pixel_report_partners() {
+
+  global $user;
+
+  $node =  node_load(1);
+
+  $header['Title'] = array(
+    'data' => 'Title',
+    'field' => 'title',
+    'sort' => 'desc'
+  );
+
+  $header['URL'] = array(
+    'data' => 'URL',
+    'field' => 'url'
+  );
+
+  $header['Hits'] = array(
+    'data' => 'Hits',
+    'field' => 'hits',
+    'style' => 'width: 50px;'
+  );
+
+  $header['Latest flush'] = array(
+    'data' => 'Latest flush',
+    'field' => 'flush_date',
+    'style' => 'width: 200px;'
+  );
+
+  $rows = array();
+
+  $sort_p = isset($_GET['sort']) && $_GET['sort'] == 'asc' ? $_GET['sort'] : 'desc';
+
+  $sort_order = isset($_GET['order']) && $_GET['order'] == $header[$_GET['order']]['data'] ? $header[$_GET['order']]['field'] : 'flush_date';
+
+  $num_rows = isset($_GET['num_rows']) && (int)$_GET['num_rows'] ? $_GET['num_rows'] : 20;
+
+  $results = db_select('pixel_pong_partners_hits_counter', 'p')
+            ->fields('p')
+            ->extend('PagerDefault')
+            ->extend('TableSort')
+            ->limit($num_rows)
+            ->orderBy($sort_order, $sort_p)
+            ->execute();
+
+  foreach ($results as $partner_url) {
+    $rows[] = array(
+      $partner_url->title,
+      $partner_url->url,
+      array('data' => $partner_url->hits, 'style' => 'width: 50px;'),
+      date('Y-m-d - h:i:sa', $partner_url->flush_date
+      ));
+  }
+
+  $element['table']['#theme'] = 'table';
+  $element['table']['#header'] = $header;
+  $element['table']['#rows'] = $rows;
+  
+  $render_array['table'] = $element['table'];
+  $render_array['pager'] = array(
+    '#theme' => 'pager',
+  );
+
+  $output = theme('table', array('header' => $header,
+  'rows' => $rows ));
+
+   $output .= theme('pager');
+  
+  return $output;
+
+}
+
+/**
+* Internal function used to generate a javascript dynamically, that should be shared with partners
+*/
+function _pixel_js(){
+  header('Content-Type: application/javascript');  
+  $server_url = variable_get('pixel_pong_remote', 'http://127.0.0.1:9187');
+
+  $pixel_srv = <<< HERE
+(function () {
+  var img, loc, seperator, titleEl, titleText = "No title", url;
+
+  if (!window.pixel_ping_tracked) {
+    loc = window.location;
+    titleEl = document.getElementsByTagName("title").item(0);
+
+    if (titleEl != null && titleEl.innerText.length)
+      titleText = titleEl.text.replace(/#{"\" + seperator}/g, "") || "";
+
+    seperator = ",";
+    url = encodeURIComponent("" + titleText + seperator + loc.protocol + "//" + loc.host + loc.pathname);
+    img = document.createElement('img');
+    img.setAttribute('src', "$server_url/pixel.gif?key=url" + seperator + url);
+    img.setAttribute('width', '1');
+    img.setAttribute('height', '1');
+    document.body.appendChild(img);
+    window.pixel_ping_tracked = true;
+  }
+}).call(this);
+HERE;
+ echo $pixel_srv;
+}

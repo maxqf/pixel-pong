@@ -1,0 +1,3 @@
+name = "Pixel Pong"
+description = "Integration with Pixel Ping, the traffic tracker from Pro Publica and DocumentCloud. Or serve your own pixel."
+core = 7.x

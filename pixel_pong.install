@@ -1,0 +1,40 @@
+<?php
+
+function pixel_pong_schema() {
+  $schema['pixel_pong_partners_hits_counter'] = array(
+    'description' => 'Partners Hits Counter',
+    'fields' => array(
+      'hid' => array(
+        'description' => 'The primary identifier for a hit.',
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE),
+      'title' => array(
+        'description' => 'Title',
+        'type' => 'varchar',
+        'length' => 512,
+        'not null' => FALSE,
+        'default' => ''),
+      'url' => array(
+        'description' => 'The title of this node, always treated a non-markup plain text.',
+        'type' => 'varchar',
+        'length' => 2048,
+        'not null' => FALSE,
+        'default' => ''),
+      'hits' => array(
+        'description' => 'Number of hits',
+        'type' => 'int',        
+        'not null' => FALSE,
+        'default' => 0),
+      'flush_date' => array(
+        'description' => t('The last flush date.'),
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0),
+      ),    
+    'primary key' => array('hid'),
+    );
+    
+  return $schema;
+}
